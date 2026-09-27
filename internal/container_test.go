@@ -6,6 +6,7 @@ import (
 	"compress/gzip"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -77,10 +78,12 @@ func TestUntarFiles(t *testing.T) {
 		name        string
 		gzip        bool
 		entries     []tarEntry
+		plantLink   string // create dest/<plantLink> as a symlink to a dir outside dest
 		expectErr   bool
 		extracted   []string // paths relative to dest that must exist with content
 		notInDest   []string // paths relative to dest that must NOT exist
-		outsideName string   // path that must NOT appear in the parent of dest
+		outsideName string   // path relative to base that must NOT appear outside dest
+		errContains string   // substring the error must contain, if any
 	}{
 		{
 			name: "valid archive",
@@ -203,6 +206,15 @@ func TestUntarFiles(t *testing.T) {
 			notInDest: []string{"checkpoint/core-1.img/subfile", "checkpoint/core-1.img"},
 		},
 		{
+			name: "child of extracted regular file is rejected",
+			entries: []tarEntry{
+				{"config.dump", tar.TypeReg, "config"},
+				{"config.dump/child.dump", tar.TypeReg, "child"},
+			},
+			expectErr:   true,
+			errContains: "conflicts with regular file",
+		},
+		{
 			name: "backslash traversal is rejected",
 			entries: []tarEntry{
 				{`checkpoint\core-..\..\escape`, tar.TypeReg, "escape"},
@@ -219,18 +231,31 @@ func TestUntarFiles(t *testing.T) {
 			notInDest: []string{"evil/config.dump", "evil/checkpoint/core-1.img", "config.dump"},
 		},
 		{
-			name: "symlink entry is skipped",
+			name: "symlink entry matching a requested file is rejected",
 			entries: []tarEntry{
 				{"config.dump", tar.TypeSymlink, "/etc/passwd"},
 			},
-			notInDest: []string{"config.dump"},
+			expectErr:   true,
+			errContains: "unsupported type",
+			notInDest:   []string{"config.dump"},
 		},
 		{
-			name: "hardlink entry is skipped",
+			name: "hardlink entry matching a requested file is rejected",
 			entries: []tarEntry{
 				{"checkpoint/core-1.img", tar.TypeLink, "checkpoint/pages-1.img"},
 			},
-			notInDest: []string{"checkpoint/core-1.img"},
+			expectErr:   true,
+			errContains: "unsupported type",
+			notInDest:   []string{"checkpoint/core-1.img"},
+		},
+		{
+			name:      "planted symlink in destination is not followed",
+			plantLink: "checkpoint",
+			entries: []tarEntry{
+				{"checkpoint/pstree.img", tar.TypeReg, "pwned"},
+			},
+			expectErr:   true,
+			outsideName: "outside/pstree.img",
 		},
 		{
 			name: "duplicate entries last wins",
@@ -256,12 +281,27 @@ func TestUntarFiles(t *testing.T) {
 			archivePath := filepath.Join(base, archiveName)
 			writeArchive(t, archivePath, test.gzip, test.entries)
 
+			if test.plantLink != "" {
+				// dest/<plantLink> points outside dest, so writing through it
+				// would escape the extraction directory.
+				outside := filepath.Join(base, "outside")
+				if mkErr := os.MkdirAll(outside, 0o700); mkErr != nil {
+					t.Fatal(mkErr)
+				}
+				if lnErr := os.Symlink(outside, filepath.Join(dest, test.plantLink)); lnErr != nil {
+					t.Fatal(lnErr)
+				}
+			}
+
 			err := UntarFiles(archivePath, dest, requiredFiles)
 			if test.expectErr && err == nil {
 				t.Errorf("expected an error, got nil")
 			}
 			if !test.expectErr && err != nil {
 				t.Errorf("expected no error, got %v", err)
+			}
+			if test.errContains != "" && err != nil && !strings.Contains(err.Error(), test.errContains) {
+				t.Errorf("expected error containing %q, got %v", test.errContains, err)
 			}
 
 			for _, rel := range test.extracted {

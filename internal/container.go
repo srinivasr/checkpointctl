@@ -291,15 +291,70 @@ func getArchiveSizes(archiveInput string) (*archiveSizes, error) {
 
 // UntarFiles unpack only specified files from an archive to the destination directory.
 func UntarFiles(src, dest string, files []string) error {
+	// Confine every write to dest at the syscall level, so a symlink planted
+	// in the destination cannot redirect a write outside of it.
+	root, err := os.OpenRoot(dest)
+	if err != nil {
+		return fmt.Errorf("opening destination directory %q: %w", dest, err)
+	}
+	defer root.Close()
+
+	// Track the regular files actually extracted, and unmatched entries
+	// sitting below one of them, so a file/directory conflict is rejected
+	// no matter which order the archive lists its entries in.
+	extracted := make(map[string]bool)
+	type conflict struct{ entry, file string }
+	var conflicts []conflict
+
 	if err := iterateTarArchive(src, func(r *tar.Reader, header *tar.Header) error {
-		// Only regular files are extracted. Directories, links and other
-		// special entries are never created in the destination directory.
-		if header.Typeflag != tar.TypeReg {
+		// Normalize the entry name for matching.
+		cleaned := filepath.Clean(header.Name)
+		name := strings.TrimPrefix(cleaned, "./")
+
+		// Check if the current entry matches any of the target files.
+		matched := false
+		for _, file := range files {
+			if strings.HasSuffix(file, "-") {
+				// CRIU numbered images (e.g., "checkpoint/core-", "checkpoint/pages-")
+				matched = strings.HasPrefix(name, file) && filepath.Dir(name) == filepath.Dir(file)
+			} else {
+				// Exact match for dumps and fixed images (e.g., "spec.dump", "config.dump", "checkpoint/pstree.img")
+				matched = (name == file)
+				// A child path of a regular file we extract is a
+				// file/directory conflict: the archive is malformed or
+				// hostile. Record it and reject below if the parent file
+				// is extracted.
+				if !matched && strings.HasPrefix(name, file+"/") {
+					conflicts = append(conflicts, conflict{header.Name, file})
+				}
+			}
+			if matched {
+				break
+			}
+		}
+
+		// Triage the entry type before looking at the path. A link or device
+		// entry is only worth an error if we were going to extract it, since
+		// we create no links and therefore never follow one from the archive.
+		switch header.Typeflag {
+		case tar.TypeReg:
+			// Regular file: extracted below.
+		case tar.TypeDir:
+			// Directories are created on demand for the files we extract.
+			return nil
+		case tar.TypeXHeader, tar.TypeXGlobalHeader:
+			// pax extended headers carry metadata only; nothing to extract.
+			return nil
+		default:
+			if matched {
+				return fmt.Errorf("archive entry %q has unsupported type %d: only regular files and directories are extracted", header.Name, header.Typeflag)
+			}
 			return nil
 		}
 
-		// Normalize name and reject any path escaping dest or containing relative traversal segments.
-		cleaned := filepath.Clean(header.Name)
+		// Reject a regular entry that escapes dest or carries a relative
+		// traversal element. os.Root confines the write below as well, so a
+		// symlink planted in dest cannot redirect it either.
 		if !filepath.IsLocal(cleaned) {
 			return fmt.Errorf("archive entry %q escapes destination directory", header.Name)
 		}
@@ -308,50 +363,41 @@ func UntarFiles(src, dest string, files []string) error {
 				return fmt.Errorf("archive entry %q contains relative traversal element", header.Name)
 			}
 		}
-
-		name := strings.TrimPrefix(cleaned, "./")
-
-		// Check if the current entry matches any of the target files.
-		for _, file := range files {
-			matched := false
-			if strings.HasSuffix(file, "-") {
-				// CRIU numbered images (e.g., "checkpoint/core-", "checkpoint/pages-")
-				matched = strings.HasPrefix(name, file) && filepath.Dir(name) == filepath.Dir(file)
-			} else {
-				// Exact match for dumps and fixed images (e.g., "spec.dump", "config.dump", "checkpoint/pstree.img")
-				matched = (name == file)
-			}
-
-			if !matched {
-				continue
-			}
-
-			destPath := filepath.Join(dest, name)
-			// Create the destination folder
-			if err := os.MkdirAll(filepath.Dir(destPath), 0o700); err != nil {
-				return err
-			}
-			// Create the destination file
-			destFile, err := os.Create(destPath)
-			if err != nil {
-				return err
-			}
-
-			// Copy the contents of the entry to the destination file
-			if _, err = io.Copy(destFile, r); err != nil {
-				_ = destFile.Close()
-				return err
-			}
-			if err = destFile.Close(); err != nil {
-				return err
-			}
-
-			// File successfully extracted, move to the next file
-			break
+		if !matched {
+			return nil
 		}
+
+		// Create the destination folder
+		if dir := filepath.Dir(name); dir != "." {
+			if err := root.MkdirAll(dir, 0o700); err != nil {
+				return fmt.Errorf("creating directory for archive entry %q: %w", header.Name, err)
+			}
+		}
+		// Create the destination file
+		destFile, err := root.OpenFile(name, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+		if err != nil {
+			return fmt.Errorf("creating file for archive entry %q: %w", header.Name, err)
+		}
+
+		// Copy the contents of the entry to the destination file
+		if _, err = io.Copy(destFile, r); err != nil {
+			_ = destFile.Close()
+			return fmt.Errorf("extracting archive entry %q: %w", header.Name, err)
+		}
+		if err = destFile.Close(); err != nil {
+			return fmt.Errorf("closing extracted file for archive entry %q: %w", header.Name, err)
+		}
+		extracted[name] = true
+
 		return nil
 	}); err != nil {
 		return fmt.Errorf("unpacking of checkpoint archive failed: %w", err)
+	}
+
+	for _, c := range conflicts {
+		if extracted[c.file] {
+			return fmt.Errorf("unpacking of checkpoint archive failed: archive entry %q conflicts with regular file %q", c.entry, c.file)
+		}
 	}
 
 	return nil
